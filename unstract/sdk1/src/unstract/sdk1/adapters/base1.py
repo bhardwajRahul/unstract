@@ -2,6 +2,7 @@ import glob
 import inspect
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -14,6 +15,126 @@ from unstract.sdk1.adapters.constants import Common
 from unstract.sdk1.adapters.enums import AdapterTypes
 
 logger = logging.getLogger(__name__)
+
+# Anthropic models that have deprecated sampling parameters (`temperature`,
+# `top_p`, `top_k`). The patterns are regex-searched against the model id
+# after lowercasing and normalizing `.` / `_` to `-`. The match is anchored at
+# the trailing edge so that unrelated future ids (`claude-opus-4-70`,
+# `claude-opus-4-75`, `claude-opus-4-7verbose`) do not match. A single entry
+# covers every encoding of the id we have observed:
+#   - Native Anthropic              `claude-opus-4-7`, `anthropic/claude-opus-4-7`
+#   - Bedrock foundation model      `anthropic.claude-opus-4-7-<date>-v1:0`
+#   - Bedrock cross-region profile  `us.anthropic.claude-opus-4-7-...`,
+#                                   `eu.`, `apac.`, `global.` variants
+#   - Bedrock foundation-model ARN  `arn:aws:bedrock:<region>::foundation-model/
+#                                    anthropic.claude-opus-4-7-...`
+#   - Bedrock inference-profile ARN `arn:aws:bedrock:<region>:<account>:
+#                                    inference-profile/us.anthropic.claude-opus-4-7-...`
+#   - Vertex AI                     `vertex_ai/claude-opus-4-7@<date>`
+#   - Azure AI Foundry              deployments whose name embeds `claude-opus-4-7`
+# Leading text (route prefixes like `converse/`, `invoke/`, `bedrock/`) passes
+# through because the regex is anchored only at the trailing edge.
+# Add new entries here when Anthropic deprecates sampling on more models.
+# Trailing anchor allows: end-of-string, or one of `-`/`:`/`@`/`/` (the
+# delimiters used in date suffixes, ARN paths, Vertex `@<date>`, and the
+# `v1:0` tag), or `v` followed by a digit (the version-tag start). A bare
+# `v` is intentionally rejected so alpha continuations like `4-7verbose` do
+# not silently match.
+# See https://docs.claude.com/en/about-claude/models/whats-new-claude-4-7
+_SAMPLING_DEPRECATED_MODEL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"claude-opus-4-7(?=$|[-:@/]|v\d)"),
+)
+_DEPRECATED_SAMPLING_PARAMS: tuple[str, ...] = ("temperature", "top_p", "top_k")
+# Fields whose value can carry a model id. `model` is universal; `model_id` is
+# Bedrock's separate ARN field used for Application Inference Profile cost
+# tracking — when callers route through an AIP, the standard model id often
+# only appears here, not in `model`.
+_MODEL_ID_FIELDS: tuple[str, ...] = ("model", "model_id")
+# Substring of a Bedrock Application Inference Profile ARN; the rest of the
+# ARN is an opaque profile id so the underlying foundation model id is not
+# recoverable from the string. Used only to narrow the debug-breadcrumb path
+# on the strip's no-match branch.
+_OPAQUE_AIP_ARN_MARKER: str = "application-inference-profile"
+
+
+def _looks_like_opaque_aip_arn(value: str | None) -> bool:
+    """Return True when the value looks like a Bedrock AIP ARN.
+
+    Bedrock AIP ARNs do not carry the underlying foundation-model id in the
+    string, so the sampling-strip detector cannot decide whether the call is
+    bound for Claude Opus 4.7.
+    """
+    return bool(value) and _OPAQUE_AIP_ARN_MARKER in value
+
+
+def _has_deprecated_sampling_params(model: str | None) -> bool:
+    """Return True when the model rejects sampling parameters.
+
+    Anthropic deprecated `temperature`, `top_p`, and `top_k` starting with
+    Claude Opus 4.7; sending any of them yields a 400 from Anthropic and from
+    the providers that proxy it (Bedrock, Azure AI Foundry, Vertex AI).
+
+    The check normalizes case and `.`/`_` separators to `-`, then regex-
+    searches against the patterns with a trailing-edge boundary, so
+    `claude-opus-4-70` and `claude-opus-4-7verbose` do not match. This
+    catches every format that embeds the model id (foundation model ids,
+    cross-region profiles, foundation-model ARNs, inference-profile ARNs,
+    Vertex `@`-suffixed ids).
+
+    It does NOT catch:
+    - Bedrock Application Inference Profile ARNs (e.g.
+      `arn:aws:bedrock:...:application-inference-profile/abcd1234`), whose
+      tail is an opaque profile id — the underlying model is not recoverable
+      from the string. Pass the AIP ARN in `model_id` and keep the standard
+      model id in `model`, or the strip won't fire.
+    - Azure AI Foundry deployment names that omit the model id; rename the
+      deployment to include `claude-opus-4-7` so detection works.
+    """
+    if not model:
+        return False
+    normalized = model.lower().replace(".", "-").replace("_", "-")
+    return any(rx.search(normalized) for rx in _SAMPLING_DEPRECATED_MODEL_PATTERNS)
+
+
+def _strip_deprecated_sampling_params(validated: dict[str, "Any"]) -> dict[str, "Any"]:
+    """Return a copy of `validated` with deprecated sampling params removed.
+
+    The input dict is not mutated. Returns a shallow copy so callers can rely
+    on `before is not after` and follow the file's copy-then-mutate style.
+
+    `temperature` is the load-bearing case: `BaseChatCompletionParameters`
+    declares `temperature: float | None = Field(default=0.1)`, so Pydantic's
+    `model_dump()` re-emits the default even when the caller never set one.
+    `top_p` and `top_k` are not declared fields and are normally dropped by
+    Pydantic, but the strip defends against caller-supplied values flowing
+    through `**adapter_metadata`.
+
+    Checks both `model` and `model_id` so Bedrock callers routing through an
+    Application Inference Profile are covered when the standard model id only
+    appears in `model_id`.
+
+    Contract change: the returned dict may not contain a `temperature` key.
+    Consumers must read via `.get("temperature")`, not `dict["temperature"]`.
+    """
+    result = dict(validated)
+    if any(_has_deprecated_sampling_params(result.get(f)) for f in _MODEL_ID_FIELDS):
+        for param in _DEPRECATED_SAMPLING_PARAMS:
+            result.pop(param, None)
+    elif any(_looks_like_opaque_aip_arn(result.get(f)) for f in _MODEL_ID_FIELDS):
+        # An opaque Bedrock AIP ARN reached us with no Anthropic model id in
+        # any field. If the underlying foundation model is Opus 4.7+, the
+        # upstream call will 400 on `temperature is deprecated`; this debug
+        # log makes the strip-skipped state distinguishable from a
+        # never-attempted strip when debugging the resulting 400. The guard
+        # is intentionally narrow — the broader "any sampling param present"
+        # form fires for every routine call because Pydantic's `model_dump`
+        # always re-emits the default `temperature=0.1`.
+        logger.debug(
+            "Sampling-param strip skipped for opaque Bedrock AIP ARN; no "
+            "model id field matched a deprecation pattern. Model ids: %s",
+            {f: result.get(f) for f in _MODEL_ID_FIELDS if result.get(f)},
+        )
+    return result
 
 
 def register_adapters(adapters: dict[str, dict[str, "Any"]], adapter_type: str) -> None:
@@ -462,7 +583,7 @@ class VertexAILLMParameters(BaseChatCompletionParameters):
         if "thinking" in result_metadata:
             validated_data["thinking"] = result_metadata["thinking"]
 
-        return validated_data
+        return _strip_deprecated_sampling_params(validated_data)
 
     @staticmethod
     def validate_model(adapter_metadata: dict[str, "Any"]) -> str:
@@ -646,7 +767,8 @@ class AWSBedrockLLMParameters(BaseChatCompletionParameters):
         # Keys mode requires non-blank values, legacy (no auth_type) is
         # lenient. Reads auth_type from result_metadata since validation_
         # metadata strips it before Pydantic.
-        return _resolve_bedrock_aws_credentials(result_metadata, validated)
+        validated = _resolve_bedrock_aws_credentials(result_metadata, validated)
+        return _strip_deprecated_sampling_params(validated)
 
     @staticmethod
     def validate_model(adapter_metadata: dict[str, "Any"]) -> str:
@@ -735,7 +857,7 @@ class AnthropicLLMParameters(BaseChatCompletionParameters):
         if enable_extended_context:
             validated["extra_headers"] = {"anthropic-beta": "context-1m-2025-08-07"}
 
-        return validated
+        return _strip_deprecated_sampling_params(validated)
 
     @staticmethod
     def validate_model(adapter_metadata: dict[str, "Any"]) -> str:
@@ -945,7 +1067,8 @@ class AzureAIFoundryLLMParameters(BaseChatCompletionParameters):
             adapter_metadata
         )
 
-        return AzureAIFoundryLLMParameters(**adapter_metadata).model_dump()
+        validated = AzureAIFoundryLLMParameters(**adapter_metadata).model_dump()
+        return _strip_deprecated_sampling_params(validated)
 
     @staticmethod
     def validate_model(adapter_metadata: dict[str, "Any"]) -> str:
